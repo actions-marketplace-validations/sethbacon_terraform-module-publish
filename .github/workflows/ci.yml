@@ -11,18 +11,155 @@ jobs:
   build-test:
     name: Lint, test, dist sync
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # hardening-exception: egress-audit — this job installs from the npm registry
+      #   and clones this repository; harden-runner has never run in this repository,
+      #   so no endpoint baseline exists and a block policy written without one fails
+      #   closed on its first run; audit is what produces that list
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - run: npm ci
+      # --ignore-scripts: npm runs dependency preinstall/install/postinstall
+      # hooks by default, which is arbitrary code from the dependency tree
+      # executing before anything here has inspected it.
+      #
+      # Carries an id and tees its output because the advisory at the foot of
+      # this job has to say WHICH npm ci failure this was. `npm ci` answers a
+      # lockfile that disagrees with package.json by refusing the whole tree
+      # up front: it installs nothing, exits, and leaves every later step
+      # `skipped` rather than `failure` — so an advisory keyed only on those
+      # later steps stays silent on the one failure that caused all of them.
+      # pipefail so tee cannot swallow npm's exit code.
+      - name: Install dependencies
+        id: install
+        run: |
+          set -o pipefail
+          npm ci --ignore-scripts 2>&1 | tee "$RUNNER_TEMP/npm-ci.log"
       - run: npm run lint
       - run: npm test
-      - name: Rebuild bundle and fail if dist is stale
+      # Executes the advisory's own `run:` block, lifted out of this file,
+      # against real npm output. The advisory is a diagnosis, and the branch
+      # that tells a lockfile refusal from any other npm ci failure keys on
+      # npm's exact wording -- which will change without telling anyone here.
+      - name: The Dependabot advisory still matches npm's wording
+        run: npm run test:advisory
+      # Split from the staleness diff below so the two failures stay tellable
+      # apart. "This bundle cannot be built at all" and "this bundle is fine but
+      # the committed copy is behind it" need opposite responses, and collapsing
+      # them onto one red step is exactly what made a mechanical dependency bump
+      # read as a broken pull request and sit for a week.
+      #
+      # `npm run build` is `npm run lint`, then esbuild, then
+      # scripts/verify-bundle.mjs — so a bundle that would not compile, or that
+      # still resolves a module at run time, fails HERE and never reaches the
+      # diff below. That ordering is load-bearing: the staleness gate compares
+      # dist/ to a fresh build OF ITSELF, so it cannot tell a good bundle from a
+      # dead one, and "rebuild and commit" would otherwise be sound advice that
+      # ships a bundle throwing MODULE_NOT_FOUND at every consumer.
+      - name: Rebuild the bundle
+        id: rebuild
+        run: npm run build
+
+      # Immediately after the build, and BEFORE the staleness diff, so it drives
+      # the bundle that build just produced on every run — including the runs
+      # where dist/ is stale, which is precisely when someone is deciding whether
+      # to commit a rebuild. Sequenced after the diff it was skipped on exactly
+      # those runs, so the bundle a maintainer was about to commit was the one
+      # nothing had executed.
+      #
+      # The staleness gate is not cover for this and never was: it compares
+      # dist/index.js to a fresh build OF ITSELF, so a bundle that throws at
+      # require time passes it byte-for-byte. esbuild fails loudly on a
+      # top-level import it cannot resolve, but not on a dependency dropped by
+      # `--external`, a `require()` inside a try/catch, or a computed specifier
+      # — each exits 0 and writes a bundle that resolves a module at run time.
+      # Lint, tests and dist-sync all stay green while every consumer of
+      # `uses: ...@v1` fails before a line of the action runs. This step is the
+      # only one here that executes the artifact consumers execute.
+      - name: Execute the built bundle and assert its guards
+        run: npm run test:dist
+
+      - name: Fail if the committed dist is stale
+        id: dist-sync
+        # Staged-then-diffed over the whole directory, matching the sibling
+        # action: a plain `git diff` compares TRACKED content only, so a file the
+        # build newly emits into dist/ is invisible to it and this gate would
+        # certify a bundle whose companion chunk was never committed. --force
+        # covers a path a .gitignore rule would otherwise hide.
         run: |
-          npm run build
-          if ! git diff --exit-code -- dist/index.js; then
+          git add --force -A -- dist
+          if ! git diff --cached --exit-code -- dist; then
             echo "::error::dist is out of date — run 'npm run build' and commit the result."
             exit 1
+          fi
+
+      # Dependabot edits package.json and the lockfile and never runs a build, so
+      # every bundled-dependency bump arrives with a stale dist and is red by
+      # construction. This step does not fix that; it says which of the two kinds
+      # of red it is and what to do about it, in the log of the run that failed.
+      #
+      # Deliberately NOT a bot that rebuilds and pushes to the branch. The usual
+      # recipe for that is `pull_request_target` with `contents: write`, which
+      # runs the pull request's own code with a writable token against the base
+      # repo — strictly worse than the problem it solves. The safe variant needs
+      # a write-capable credential this repo does not have, and the GITHUB_TOKEN
+      # variant cannot work at all here: a token-authored push produces no
+      # `pull_request` event, so `Conventional PR Title` — a required check that
+      # only that event creates — would never appear on the new head commit and
+      # the PR would go from actionably red to permanently unmergeable. See
+      # "Rebuilding dist/" in README.md.
+      #
+      # github.head_ref reaches the shell through env, never through `${{ }}`
+      # interpolation into the script body: a branch name is attacker-chosen
+      # text, and pasting it into a `run:` block is a shell-injection sink.
+      #
+      # The bot test is `github.event.pull_request.user.login`, not
+      # `github.actor`. github.actor is whoever most recently caused a run — a
+      # re-run, or a push onto the branch — so a third party can make it read
+      # `dependabot[bot]` on a pull request Dependabot did not author. That is
+      # zizmor's `bot-conditions` audit. Nothing privileged hangs off this
+      # condition today (it only decides which message prints, in a job holding
+      # `contents: read`), but it is the gate anything privileged would reuse,
+      # so it is written the non-spoofable way now rather than after something
+      # is attached to it. Paired with a same-repository head check: Dependabot
+      # branches live in THIS repo, so a head ref that does not is not the case
+      # this advice is for.
+      - name: What to do about this Dependabot bump
+        if: >-
+          always() &&
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          (steps.install.outcome == 'failure' ||
+           steps.rebuild.outcome == 'failure' ||
+           steps.dist-sync.outcome == 'failure')
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          INSTALL: ${{ steps.install.outcome }}
+          REBUILD: ${{ steps.rebuild.outcome }}
+          NPM_CI_LOG: ${{ runner.temp }}/npm-ci.log
+        run: |
+          if [ "$INSTALL" = "failure" ]; then
+            # Read back what npm actually printed instead of inferring the
+            # cause from the fact that install failed. An advisory that names a
+            # specific defect it has not checked for is worse than a generic
+            # one: it sends the reader to regenerate a lockfile that was never
+            # the problem, with the authority of a diagnosis.
+            if grep -q "can only install packages when your package.json and package-lock.json" "$NPM_CI_LOG"; then
+              missing=$(sed -n 's/.*Missing: \(.*\) from lock file.*/\1/p' "$NPM_CI_LOG" | paste -sd', ' -)
+              echo "::error::Dependabot's lockfile update is incomplete: npm ci refused the tree because package-lock.json disagrees with package.json (missing: ${missing:-see the step log}). Nothing was installed, so the later steps in this job are skipped rather than failed -- the other red checks on this PR are consequences of this one break, not separate problems. The usual cause is optional platform-specific binaries dropped from a transitive bump, which are absent from the lockfile but still required on other architectures. To land it: git fetch origin \"$HEAD_REF\" && git switch \"$HEAD_REF\" && npm install --package-lock-only && git commit -am 'fix(deps): complete the lockfile for this bump' && git push. Check the diff adds only the missing entries before pushing -- if it moves other versions, this is not that failure."
+            else
+              echo "::error::npm ci failed, so nothing else in this job ran and the other red checks on this PR are consequences of it rather than independent findings. This was NOT a lockfile-sync refusal, so neither a rebuild nor 'npm install --package-lock-only' is indicated -- read the 'Install dependencies' step above for npm's actual error before acting."
+            fi
+          elif [ "$REBUILD" = "failure" ]; then
+            echo "::error::This bump does not merely need a rebuild — the bundle cannot be built from it. Either the TypeScript compile failed, or esbuild could not resolve a dependency, or the built bundle still resolves one at run time and would die with MODULE_NOT_FOUND (see the 'Rebuild the bundle' step above for which). Committing a rebuilt dist/ here would ship an action that fails before it runs. Close the PR or pin the dependency until upstream is fixed."
+          else
+            echo "::notice::This bump builds cleanly and the rebuilt bundle passed verification — the only thing missing is the committed dist/. To land it: git fetch origin \"$HEAD_REF\" && git switch \"$HEAD_REF\" && npm ci && npm run build && git commit -am 'build: rebuild dist for this dependency bump' && git push"
           fi

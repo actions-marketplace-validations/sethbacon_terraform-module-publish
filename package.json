@@ -5,20 +5,27 @@
   "description": "GitHub Action: publish a Terraform/OpenTofu module version to a self-hosted registry or HCP Terraform / TFE.",
   "license": "Apache-2.0",
   "scripts": {
-    "build": "ncc build src/index.ts -o dist --minify --no-source-map-register",
-    "test": "vitest run",
-    "lint": "tsc --noEmit"
+    "build": "npm run lint && esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --outdir=dist --minify && npm run verify:bundle",
+    "verify:bundle": "node scripts/verify-bundle.mjs",
+    "test": "vitest run --coverage",
+    "test:dist": "node scripts/dist-behaviour.mjs",
+    "test:advisory": "node scripts/test-dependabot-advisory.mjs",
+    "lint": "tsc --noEmit",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@actions/core": "^1.11.1"
+    "@4cloudguru/pipeline-task-core": "^0.7.0",
+    "@actions/core": "^3.0.1",
+    "undici": "^7.29.0"
   },
   "overrides": {
-    "undici": "^6.27.0"
+    "undici": "$undici"
   },
   "devDependencies": {
-    "@types/node": "^24",
-    "@vercel/ncc": "^0.38.1",
-    "typescript": "^5.6.0",
-    "vitest": "^4.1.9"
+    "@types/node": "^26",
+    "@vitest/coverage-v8": "^4.1.11",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
   }
 }

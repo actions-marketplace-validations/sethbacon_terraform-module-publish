@@ -1,0 +1,162 @@
+---
+name: Security scan
+
+# Two checks that nothing else in this repo performs.
+#
+# `audit` runs on a schedule as well as on PRs because the vulnerable
+# dependency is usually not one a PR touches: undici is inlined into
+# dist/index.js, so an advisory published against the pinned version is live in
+# every consumer's job the moment it lands, and dependency-review would never
+# mention it.
+#
+# `workflows` lints the workflow files themselves. Either zizmor or actionlint
+# would have flagged the missing `permissions:` block and the mutable tag pins
+# that this repo carried until now.
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: npm audit (runtime deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # hardening-exception: egress-audit — this job installs from the npm registry
+      #   and clones this repository; harden-runner has never run in this repository,
+      #   so no endpoint baseline exists and a block policy written without one fails
+      #   closed on its first run; audit is what produces that list
+      - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - run: npm ci --ignore-scripts
+
+      # --omit=dev: a devDependency advisory does not reach a consumer, since
+      # only dist/index.js ships. moderate, not high: this action carries a
+      # bearer credential to a remote host, so a moderate flaw in the bundled
+      # HTTP stack is not obviously acceptable.
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=moderate
+
+  # The dist-sync step in ci.yml answers "is dist stale in THIS pull request?".
+  # That is a different question from "does the committed bundle still match a
+  # build of the current lockfile?", which can drift with no PR open at all —
+  # a transitive dependency resolving differently, or a bundled-dependency
+  # Dependabot PR merged without the rebuild. Nothing surfaced that before.
+  bundle-drift:
+    name: Committed dist matches a fresh build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # hardening-exception: egress-audit — this job installs from the npm registry
+      #   and clones this repository; harden-runner has never run in this repository,
+      #   so no endpoint baseline exists and a block policy written without one fails
+      #   closed on its first run; audit is what produces that list
+      - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      # --ignore-scripts: npm runs dependency preinstall/install/postinstall
+
+      # hooks by default, which is arbitrary code from the dependency tree
+
+      # executing before anything here has inspected it.
+
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+
+      - name: Fail if the committed bundle has drifted
+        # Staged-then-diffed over the whole directory, matching ci.yml and the
+        # sibling action: a plain `git diff` compares TRACKED content only, so a
+        # file the build newly emits into dist/ is invisible to it and this gate
+        # would certify a bundle whose companion chunk was never committed.
+        # --force covers a path a .gitignore rule would otherwise hide.
+        run: |
+          git add --force -A -- dist
+          if ! git diff --cached --exit-code -- dist; then
+            echo "::error::dist/ no longer matches a build of the current lockfile. A bundled dependency changed without the bundle being rebuilt — check out main, run 'npm run build', and commit dist/."
+            exit 1
+          fi
+
+  workflows:
+    name: Lint workflows (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      # hardening-exception: egress-audit — this job clones this repository;
+      #   harden-runner has never run in this repository, so no endpoint baseline
+      #   exists and a block policy written without one fails closed on its first run;
+      #   audit is what produces that list
+      - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+
+        # DO NOT drop this `with:` block. `advanced-security` defaults to TRUE,
+
+        # which selects --format=sarif -- and there zizmor EXITS 0 WHATEVER IT
+
+        # FINDS. The job goes green and the findings arrive as code-scanning
+
+        # alerts instead, so the gate silently becomes a reporter. This repo was
+
+        # one of five in that state: terraform-drift-contract's "Scan Workflows
+
+        # (zizmor)" reported success on main with three findings open.
+
+        #
+
+        # The version is named rather than left to the action's `latest` default.
+
+        # `latest` is safe -- an alias inside a digest table frozen by the
+
+        # action's own SHA pin, not a tag resolved at runtime -- but it is
+
+        # illegible: the scanner version would appear nowhere in this repository,
+
+        # and bumping the action SHA would silently change which zizmor runs.
+
+        with:
+
+          advanced-security: false
+
+          version: "1.29.0"
+
+          annotations: true

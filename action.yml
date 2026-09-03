@@ -30,8 +30,19 @@ inputs:
     description: API key for the private registry (Bearer). Required for registry-type=private.
     required: false
     default: ""
+  ca-cert:
+    description: >-
+      PEM certificate(s) for the CA that issued the registry's TLS certificate,
+      for a registry fronted by a private CA. Trusting the CA keeps both
+      certificate-chain and hostname verification on. When set, it replaces the
+      default trust store for the action's registry requests.
+    required: false
+    default: ""
   skip-tls-verify:
-    description: Disable TLS verification for the private registry (private-CA endpoints only).
+    description: >-
+      REMOVED. This disabled certificate AND hostname verification on requests
+      carrying the registry API key, so setting it now fails the step. Use
+      `ca-cert` instead.
     required: false
     default: "false"
   # --- HCP / TFE ---
@@ -44,19 +55,49 @@ inputs:
     required: false
     default: ""
   vcs-repo-identifier:
-    description: VCS repo identifier (org/repo) used to create the module if missing.
+    description: >-
+      VCS repo identifier (org/repo) used to create a VCS-CONNECTED module if it
+      does not exist. Supply it together with `vcs-oauth-token-id`; supplying
+      only one of the pair fails the step rather than creating a module of the
+      other kind. Leave BOTH empty (the default) for API-driven publishing: a
+      missing module is then created with no VCS connection, and its versions
+      are published by uploading the archive built from `module-directory`.
     required: false
     default: ""
   vcs-branch:
-    description: VCS branch for a VCS-connected HCP module.
+    description: >-
+      VCS branch for a VCS-connected HCP module. Only consulted when a module
+      has to be created AND the VCS pair above is supplied. Leave empty (the
+      default) to create a TAG-based module, whose versions HCP imports from
+      pushed git tags. Setting a branch creates a branch-based module, whose
+      versions are created through the API and stay 'pending' until this action
+      uploads the archive built from `module-directory`.
     required: false
-    default: main
+    default: ""
+  module-directory:
+    description: >-
+      Directory holding the module source, archived and uploaded when HCP
+      answers version creation with an upload link — that is, for a branch-based
+      module (`vcs-branch` set) or one with no VCS repo. Its contents land at the
+      archive root, so it must hold the module's root .tf files. `.git` and
+      `.terraform` are excluded. Unused on the tag-based path, where HCP takes
+      the content from the pushed tag itself.
+    required: false
+    default: "."
   vcs-oauth-token-id:
-    description: HCP VCS OAuth token ID used to create the module if missing.
+    description: >-
+      HCP VCS OAuth token ID used to create a VCS-connected module if it does
+      not exist. Pairs with `vcs-repo-identifier`; see that input for what
+      leaving both empty does.
     required: false
     default: ""
   commit-sha:
-    description: Commit SHA to associate with the new HCP module version.
+    description: >-
+      Commit SHA recorded on the new HCP module version. Left empty (the
+      default) it falls back to the runner's GITHUB_SHA — the commit the
+      workflow ran on — so the registry's version record is tied to a commit
+      without the workflow having to set anything. Set it only when the version
+      genuinely comes from a different commit.
     required: false
     default: ""
   # --- common ---
@@ -68,6 +109,16 @@ inputs:
     description: Wait timeout in seconds (when wait-for-publish is true).
     required: false
     default: "180"
+  registry-allowed-hosts:
+    description: >-
+      Comma/newline-separated hosts the registry-url / hcp-address requests may
+      reach, applied to the initial URL and to every redirect hop. A `*.` prefix
+      matches exactly one label (`*.registry.example.com`). When set, only these
+      hosts are permitted — which is how a deliberately-private, self-hosted
+      registry stays reachable. When empty, any public host is permitted and
+      private, link-local or otherwise reserved destinations are refused.
+    required: false
+    default: ""
 
 outputs:
   published:
